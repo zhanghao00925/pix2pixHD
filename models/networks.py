@@ -34,6 +34,8 @@ def define_G(input_nc, output_nc, ngf, netG, n_downsample_global=3, n_blocks_glo
                                   n_local_enhancers, n_blocks_local, norm_layer)
     elif netG == 'encoder':
         netG = Encoder(input_nc, output_nc, ngf, n_downsample_global, norm_layer)
+    elif netG == 'depthGan':
+        netG = DepthMapGenerator(input_nc, output_nc, ngf, n_downsample_global, n_blocks_global, norm_layer)
     else:
         raise('generator not implemented!')
     print(netG)
@@ -45,7 +47,11 @@ def define_G(input_nc, output_nc, ngf, netG, n_downsample_global=3, n_blocks_glo
 
 def define_D(input_nc, ndf, n_layers_D, norm='instance', use_sigmoid=False, num_D=1, getIntermFeat=False, gpu_ids=[]):        
     norm_layer = get_norm_layer(norm_type=norm)   
-    netD = MultiscaleDiscriminator(input_nc, ndf, n_layers_D, norm_layer, use_sigmoid, num_D, getIntermFeat)   
+    # Use original discriminator
+    # netD = MultiscaleDiscriminator(input_nc, ndf, n_layers_D, norm_layer, use_sigmoid, num_D, getIntermFeat)   
+
+    # Use depth map discriminator
+    netD = DepthMapDiscriminator(input_nc, ndf, n_layers_D, norm_layer, use_sigmoid, num_D, getIntermFeat)
     print(netD)
     if len(gpu_ids) > 0:
         assert(torch.cuda.is_available())
@@ -126,6 +132,37 @@ class VGGLoss(nn.Module):
 ##############################################################################
 # Generator
 ##############################################################################
+class DepthMapGenerator(nn.Module):
+    def __init__(self, input_nc, output_nc, ngf=32, n_downsample_global=3, n_blocks_global=9, 
+                 n_local_enhancers=1, n_blocks_local=3, norm_layer=nn.BatchNorm2d, padding_type='reflect'):        
+        super(DepthMapGenerator, self).__init__()
+        self.n_local_enhancers = n_local_enhancers
+        
+        ###### global generator model #####           
+        ngf_global = ngf * (2**n_local_enhancers)
+        model_global = GlobalGenerator(input_nc, output_nc, ngf_global, n_downsample_global, n_blocks_global, norm_layer).model_depth_map
+        
+        setattr(self, 'OutputGeneratorModel', nn.Sequential(*model_global))
+
+        ###### Depth Map generator model #####
+        ngf_depth_map = ngf * (2**n_local_enhancers)
+        model_depth_map = GlobalGenerator(input_nc, output_nc, ngf_depth_map, n_downsample_global, n_blocks_global, norm_layer).model
+        
+        setattr(self, 'DepthGeneratorModel', nn.Sequential(*model_depth_map))            
+        
+        self.downsample = nn.AvgPool2d(3, stride=2, padding=[1, 1], count_include_pad=False)
+
+    def forward(self, input):
+        ### generate depth map
+        model_generate_depth = getattr(self, 'DepthGeneratorModel')
+        output_depth =  model_generate_depth(input)
+        ### combine depth map and semantic map
+        output_depth.append(input)
+        ### generate output map
+        model_generate_output = getattr(self, 'OutputGeneratorModel')
+        output = model_generate_output(output_depth)
+        return output
+
 class LocalEnhancer(nn.Module):
     def __init__(self, input_nc, output_nc, ngf=32, n_downsample_global=3, n_blocks_global=9, 
                  n_local_enhancers=1, n_blocks_local=3, norm_layer=nn.BatchNorm2d, padding_type='reflect'):        
@@ -288,6 +325,67 @@ class Encoder(nn.Module):
                     mean_feat = torch.mean(output_ins).expand_as(output_ins)                                        
                     outputs_mean[indices[:,0] + b, indices[:,1] + j, indices[:,2], indices[:,3]] = mean_feat                       
         return outputs_mean
+
+class DepthMapMultiDiscriminator(nn.Module):
+    def __init__(self, input_nc, ndf=64, n_layers=3, norm_layer=nn.BatchNorm2d, 
+                 use_sigmoid=False, num_D=3, getIntermFeat=False):
+        super(DepthMapMultiDiscriminator, self).__init__()
+        self.num_D = num_D
+        self.n_layers = n_layers
+        self.getIntermFeat = getIntermFeat
+
+        ### Depth Map Multi Discriminator
+        for i in range(num_D):
+            netD = NLayerDiscriminator(input_nc, ndf, n_layers, norm_layer, use_sigmoid, getIntermFeat)
+            if getIntermFeat:                                
+                for j in range(n_layers+2):
+                    setattr(self, 'depth_scale'+str(i)+'_layer'+str(j), getattr(netD, 'model'+str(j)))                                   
+            else:
+                setattr(self, 'depth_layer'+str(i), netD.model)
+        
+        ### Output Image Multi Discriminator
+        for i in range(num_D):
+            netD = NLayerDiscriminator(input_nc, ndf, n_layers, norm_layer, use_sigmoid, getIntermFeat)
+            if getIntermFeat:                                
+                for j in range(n_layers+2):
+                    setattr(self, 'output_scale'+str(i)+'_layer'+str(j), getattr(netD, 'model'+str(j)))                                   
+            else:
+                setattr(self, 'output_layer'+str(i), netD.model)
+
+        self.downsample = nn.AvgPool2d(3, stride=2, padding=[1, 1], count_include_pad=False)
+
+    def singleD_forward(self, model, input):
+        if self.getIntermFeat:
+            result = [input]
+            for i in range(len(model)):
+                result.append(model[i](result[-1]))
+            return result[1:]
+        else:
+            return [model(input)]
+
+    def forward(self, input):        
+        num_D = self.num_D
+        result = []
+        input_downsampled = input
+        ### Depth Map Multi Discriminator
+        for i in range(num_D):
+            if self.getIntermFeat:
+                model = [getattr(self, 'depth_scale'+str(num_D-1-i)+'_layer'+str(j)) for j in range(self.n_layers+2)]
+            else:
+                model = getattr(self, 'depth_layer'+str(num_D-1-i))
+            result.append(self.singleD_forward(model, input_downsampled))
+            if i != (num_D-1):
+                input_downsampled = self.downsample(input_downsampled)
+        ### Output Image Multi Discriminator
+        for i in range(num_D):
+            if self.getIntermFeat:
+                model = [getattr(self, 'output_scale'+str(num_D-1-i)+'_layer'+str(j)) for j in range(self.n_layers+2)]
+            else:
+                model = getattr(self, 'output_layer'+str(num_D-1-i))
+            result.append(self.singleD_forward(model, input_downsampled))
+            if i != (num_D-1):
+                input_downsampled = self.downsample(input_downsampled)
+        return result
 
 class MultiscaleDiscriminator(nn.Module):
     def __init__(self, input_nc, ndf=64, n_layers=3, norm_layer=nn.BatchNorm2d, 
